@@ -1,0 +1,19 @@
+# Local documentation and release artifacts
+/docs/
+/dist/
+
+# Build output and caches
+.build/
+.cache/
+target/
+__pycache__/
+*.pyc
+
+# IDE and macOS files
+.idea/
+.swiftpm/
+cmake-build-*/
+.DS_Store
+
+# Generated license index (license texts remain included)
+/ThirdPartyNotices/*.md

@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
+
+[package]
+name = "ptouch-render"
+description = "Label rendering engine for Brother P-Touch printers"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+# Most render source is MIT. raster.rs is GPL and the crate links the GPL
+# ptouch-core crate, so the distributed crate is GPL-3.0-or-later.
+license = "MIT AND GPL-3.0-or-later"
+repository.workspace = true
+
+[dependencies]
+ptouch-core = { path = "../ptouch-core" }
+image = { version = "0.25", default-features = false, features = ["default-formats"] }
+resvg = "0.48"
+cosmic-text = "0.19"
+log = "0.4"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.1"
+base64 = "0.23"
+flate2 = "1.1"

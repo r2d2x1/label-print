@@ -1,0 +1,13 @@
+[package]
+name = "label-backend"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Validated C ABI for the LabelPrint macOS label editor"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+ptouch-core = { path = "../vendor/ptouch-rs/crates/ptouch-core" }
+serde_json = "1"

@@ -6,6 +6,7 @@ import LabelCore
 @MainActor enum SelfTest {
     static func run() async throws {
         _ = NSApplication.shared
+        try InteractionChecks.run()
         try CloseChecks.run()
         var fixedSample = LabelDocument.sample; fixedSample.autoLength = false
         let sample = try LabelRenderer.render(fixedSample)
@@ -104,7 +105,27 @@ import LabelCore
 
 @main enum EntryPoint {
     @MainActor static func main() async {
-        if CommandLine.arguments.contains("--print-margin-test") {
+        if CommandLine.arguments.contains("--interaction-test") {
+            do { try InteractionChecks.run() }
+            catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
+        } else if let index = CommandLine.arguments.firstIndex(of: "--pdf-print-file"), CommandLine.arguments.count > index + 2 {
+            do { try SheetPDFCalibration.fileOnly(
+                input: URL(fileURLWithPath: CommandLine.arguments[index + 1]),
+                output: URL(fileURLWithPath: CommandLine.arguments[index + 2])) }
+            catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
+        } else if CommandLine.arguments.contains("--pdf-size-audit") {
+            do { try SheetPDFCalibration.run() }
+            catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
+        } else if CommandLine.arguments.contains("--editor-checks") {
+            do {
+                _ = NSApplication.shared
+                try CloseChecks.run(); try DragChecks.run(); try FontChecks.run()
+                try AlignmentChecks.run(); try FitChecks.run(); try ClipboardChecks.run()
+            } catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
+        } else if CommandLine.arguments.contains("--sheet-test") {
+            do { try SheetChecks.run() }
+            catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
+        } else if CommandLine.arguments.contains("--print-margin-test") {
             do { try await PrintMarginTest.run() }
             catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
         } else if CommandLine.arguments.contains("--drag-benchmark") {

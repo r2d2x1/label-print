@@ -4,6 +4,23 @@ import AppKit
     static func run() throws {
         let delegate = AppDelegate()
         let window = NSWindow(contentRect: .zero, styleMask: [.titled, .closable], backing: .buffered, defer: true)
+        // Attaching/re-attaching SwiftUI content must not hide, resize, or show
+        // the window. The previous startup bridge changed all three asynchronously.
+        let binding = EditorWindowBinding.BindingView()
+        binding.appDelegate = delegate
+        let initialFrame = window.frame
+        window.alphaValue = 0.8
+        window.contentView = binding
+        guard window.delegate === delegate, window.frame == initialFrame,
+              window.alphaValue == 0.8, !window.isVisible else {
+            throw RenderError.failed("Window attachment changed startup presentation")
+        }
+        binding.removeFromSuperview()
+        window.contentView = binding
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+        guard window.frame == initialFrame, window.alphaValue == 0.8, !window.isVisible else {
+            throw RenderError.failed("Deferred window attachment changed startup presentation")
+        }
         var confirmations = 0
         var allow = true
         var reply: NSApplication.TerminateReply = .terminateCancel
@@ -24,6 +41,6 @@ import AppKit
         guard withExtendedLifetime(cleanStore, { clean.applicationShouldTerminate(NSApp) }) == .terminateNow else {
             throw RenderError.failed("Clean document could not quit")
         }
-        print("PASS: close and Quit share one confirmation; cancel keeps window open and later Quit confirms again")
+        print("PASS: window binding preserves visibility, size and opacity; close and Quit share one confirmation; cancel keeps window open and later Quit confirms again")
     }
 }

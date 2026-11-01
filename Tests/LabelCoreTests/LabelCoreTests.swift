@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import LabelCore
 
 func checkEqual<T: Equatable>(_ a: T, _ b: T) { precondition(a == b, "Expected \(a) == \(b)") }
@@ -11,6 +12,9 @@ func checkThrows<T>(_ expression: @autoclosure () throws -> T) {
 @main struct LabelCoreChecks {
     static func main() throws {
         let checks = LabelCoreChecks()
+        try checks.testAutoFitText()
+        try checks.testImageAspectRatio()
+        try checks.testSheetLayouts()
         try checks.testPhysicalDimensionsAndRulers()
         checks.testAutoLengthTracksArtworkAndMargin()
         try checks.testEmbeddedImageRoundTrip()
@@ -18,6 +22,58 @@ func checkThrows<T>(_ expression: @autoclosure () throws -> T) {
         checks.testUndoRedoAndBranching()
         try checks.testMinimumLabelLengthAndCenteredMigration()
         print("PASS: 5 document checks (dimensions/rulers, auto length, file round-trip, invalid files, history)")
+    }
+    func testSheetLayouts() throws {
+        for template in SheetTemplate.all {
+            var layout = SheetLayout(templateID: template.id)
+            try layout.validated()
+            for index in 0..<template.count {
+                let rect = template.rect(at: index)
+                checkTrue(rect.minX >= 0 && rect.minY >= 0 && rect.maxX <= 210.001 && rect.maxY <= 297.001)
+            }
+            layout.labels[0] = [LabelItem(kind: .text, content: "SOURCE", x: 2, y: 2, width: 20, height: 4)]
+            layout.copyLabel(from: 0, to: Set(0..<template.count))
+            checkEqual(layout.labels[0][0].content, "SOURCE")
+            checkEqual(Set(layout.labels.flatMap { $0.map(\.id) }).count, template.count)
+            try layout.validated()
+            layout.printPositions.insert(-1)
+            checkThrows(try layout.validated())
+        }
+        print("PASS: A4 template bounds, independent copies, unique IDs and position validation")
+    }
+    func testImageAspectRatio() throws {
+        var item = LabelItem(kind: .image, content: "image", x: 0, y: 0, width: 8, height: 4)
+        checkFalse(item.keepsAspectRatio)
+        item.lockAspectRatio = true
+        item.resizeImage(width: 12, maxWidth: 40, maxHeight: 12)
+        checkEqual(item.width, 12); checkEqual(item.height, 6)
+        item.resizeImage(height: 8, maxWidth: 40, maxHeight: 12)
+        checkEqual(item.width, 16); checkEqual(item.height, 8)
+        item.resizeImage(width: 100, maxWidth: 40, maxHeight: 12)
+        checkEqual(item.width, 24); checkEqual(item.height, 12)
+        let restored = try JSONDecoder().decode(LabelItem.self, from: JSONEncoder().encode(item))
+        checkTrue(restored.keepsAspectRatio)
+        item.lockAspectRatio = false
+        item.resizeImage(width: 10, maxWidth: 40, maxHeight: 12)
+        checkEqual(item.width, 24)
+        print("PASS: image aspect ratio, width/height edits, size limits, persistence and unlock")
+    }
+    func testAutoFitText() throws {
+        var item = LabelItem(kind: .text, content: "New text", x: 0, y: 0, width: 30, height: 8)
+        let legacy = try JSONEncoder().encode(item)
+        checkFalse(try JSONDecoder().decode(LabelItem.self, from: legacy).automaticallyFitsText)
+        item.fitTextToBox(); checkEqual(item.fontSize, 10)
+        item.autoFitText = true; item.fitTextToBox()
+        let initial = item.fontSize
+        item.width /= 2; item.height /= 2; item.fitTextToBox()
+        checkTrue(item.fontSize < initial)
+        let font = item.resolvedFont(ofSize: item.fontSize)
+        checkTrue(font.ascender - font.descender + font.leading <= item.height * 72 / 25.4)
+        let restored = try JSONDecoder().decode(LabelItem.self, from: JSONEncoder().encode(item))
+        checkTrue(restored.automaticallyFitsText)
+        item.autoFitText = false; let fixed = item.fontSize
+        item.height *= 2; item.fitTextToBox(); checkEqual(item.fontSize, fixed)
+        print("PASS: text auto fit, fixed size, font bounds and persistence")
     }
     func testMinimumLabelLengthAndCenteredMigration() throws {
         var short = LabelDocument.blank; short.lengthMM = 20

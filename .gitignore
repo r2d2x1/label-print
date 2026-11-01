@@ -1,6 +1,7 @@
 # Local documentation and release artifacts
 /docs/
 /dist/
+/output/
 
 # Build output and caches
 .build/

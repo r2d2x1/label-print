@@ -59,6 +59,23 @@ import LabelCore
     @Published var snapX: Double?
     @Published var snapY: Double?
     @Published var preview: CGImage?
+    @Published var sheetPreview: CGImage?
+    @Published var sheetOverview = true
+    @Published var printerName = "PT-2430PC"
+    @Published var systemPrinters: [String] = EditorStore.a4Printers()
+    static func a4Printers() -> [String] {
+        NSPrinter.printerNames.filter { name in
+            guard !name.localizedCaseInsensitiveContains("PT-2430PC"), let printer = NSPrinter(name: name) else { return false }
+            let size = printer.pageSize(forPaper: .init(rawValue: "A4"))
+            return abs(size.width - 210 * 72 / 25.4) < 3 && abs(size.height - 297 * 72 / 25.4) < 3
+        }
+    }
+    @Published var copySheet = false
+    private var tapeDraft: LabelDocument?
+    private var sheetDraft: LabelDocument?
+    private var tapeHistory = DocumentHistory()
+    private var sheetHistory = DocumentHistory()
+    var isA4: Bool { document.sheet != nil }
     @Published var renderError: String?
     @Published var message = "Printer not checked"
     @Published var connected = false
@@ -69,6 +86,10 @@ import LabelCore
     @Published var fit = true
     @Published var pointsPerMM = 72.0 / 25.4
     @Published var iconPicker = false
+    @Published var textEditRequest: UUID?
+    @Published var textEditSelectAll = false
+    @Published var cropImageItem: LabelItem?
+    private var textEditStart: LabelDocument?
     @Published var fileURL: URL?
     @Published var dirty = false
     @Published var history = DocumentHistory()
@@ -96,7 +117,10 @@ import LabelCore
     func render() {
         renderCount += 1
         do {
-            let output = try LabelRenderer.render(document)
+            let output = document.sheet == nil ? try LabelRenderer.render(document) : nil
+            if document.sheet != nil {
+                sheetPreview = try SheetRenderer.preview(SheetRenderer.pdf(document, printOnly: false))
+            } else { sheetPreview = nil }
             var next: [UUID: ItemSprite] = [:]
             for item in document.items {
                 let width = document.itemWidthMM(item)
@@ -104,24 +128,43 @@ import LabelCore
                 if let cached = sprites[item.id], cached.signature == signature, cached.widthMM == width {
                     next[item.id] = cached
                 } else {
-                    let image = try LabelRenderer.renderSprite(item, widthMM: width)
+                    let image = try LabelRenderer.renderSprite(item, widthMM: width, color: isA4)
                     next[item.id] = ItemSprite(signature: signature, widthMM: width, image: image,
-                                               smoothImage: try LabelRenderer.renderSprite(item, widthMM: width, smooth: true))
+                                               smoothImage: try LabelRenderer.renderSprite(item, widthMM: width, smooth: true, color: isA4))
                     spriteRenderCount += 1
                 }
             }
-            sprites = next; rendered = output; preview = output.image; renderError = nil
+            sprites = next; rendered = output; preview = output?.image ?? sheetPreview; renderError = nil
         } catch { sprites = [:]; rendered = nil; preview = nil; renderError = error.localizedDescription }
     }
     func change(_ action: (inout LabelDocument) -> Void) {
-        let old = document; action(&document)
-        guard old != document else { return }
-        history.record(old); dirty = true; render()
+        // Native fields may commit an unchanged value after a toolbar action.
+        // Such commits must not end a newly requested text-edit session.
+        var next = document; action(&next)
+        for index in next.items.indices {
+            next.items[index].fitTextToBox(constrainWidth: !next.autoLength)
+        }
+        next.syncActiveLabel()
+        guard next != document else { return }
+        finishTextEditing()
+        history.record(document); document = next; dirty = true; render()
     }
     func edit(_ action: (inout LabelItem) -> Void) {
         guard let index = document.items.firstIndex(where: { $0.id == selection }) else { return }
         change { doc in
             var item = doc.items[index]; action(&item); clamp(&item, in: doc); doc.items[index] = item
+        }
+    }
+    func setDimension(_ key: WritableKeyPath<LabelItem, Double>, value: Double) {
+        guard value.isFinite else { return }
+        let maxWidth = document.autoLength ? 1000 : document.lengthMM
+        let maxHeight = document.tapeMM
+        edit { item in
+            if item.keepsAspectRatio && (key == \LabelItem.width || key == \LabelItem.height) {
+                item.resizeImage(width: key == \LabelItem.width ? value : nil,
+                                 height: key == \LabelItem.height ? value : nil,
+                                 maxWidth: maxWidth, maxHeight: maxHeight)
+            } else { item[keyPath: key] = value }
         }
     }
     private func clamp(_ item: inout LabelItem, in doc: LabelDocument) {
@@ -131,6 +174,7 @@ import LabelCore
         item.x = max(0, min(item.x, (doc.autoLength ? 1000 : doc.lengthMM) - item.width))
         item.y = max(0, min(item.y, doc.tapeMM - item.height))
         item.fontSize = max(1, min(200, item.fontSize))
+        item.fitTextToBox(constrainWidth: !doc.autoLength)
     }
     func setLength(_ value: Double) {
         guard value.isFinite else { return }
@@ -147,9 +191,23 @@ import LabelCore
     func setAutoLength(_ enabled: Bool) {
         if enabled { fitLengthToContent() } else { setLength(document.effectiveLengthMM) }
     }
+    func beginTextEditing(_ id: UUID, selectAll: Bool = false) {
+        guard document.items.contains(where: { $0.id == id && $0.kind == .text }) else { return }
+        finishTextEditing()
+        selection = id; textEditSelectAll = selectAll; textEditStart = document; textEditRequest = id
+    }
+    func finishTextEditing() {
+        if let start = textEditStart, start != document { history.record(start) }
+        textEditStart = nil; textEditRequest = nil
+    }
     func editText(id: UUID, content: String) {
         guard let index = document.items.firstIndex(where: { $0.id == id }) else { return }
-        change { $0.items[index].content = content }
+        if textEditStart != nil && textEditRequest == id {
+            guard document.items[index].content != content else { return }
+            document.items[index].content = content
+            document.items[index].fitTextToBox(constrainWidth: !document.autoLength)
+            document.syncActiveLabel(); dirty = true; render()
+        } else { change { $0.items[index].content = content } }
     }
     func resizeTape(_ value: Double) {
         change { doc in
@@ -160,11 +218,13 @@ import LabelCore
         }
     }
     func add(_ kind: ItemKind, content: String = "", data: Data? = nil) {
+        if isA4 && sheetOverview { sheetOverview = false; fit = true }
         let inset = document.printableInsetMM + 0.2
         var item = LabelItem(kind: kind, content: content.isEmpty ? (kind == .text ? "New text" : "https://example.com") : content,
             x: 2, y: inset, width: kind == .text ? 30 : 8, height: kind == .text ? 4.5 : 8)
         item.imageData = data; clamp(&item, in: document)
         change { $0.items.append(item) }; selection = item.id
+        if kind == .text { beginTextEditing(item.id, selectAll: true) }
     }
     func duplicate() {
         var copies = selectedItems
@@ -181,19 +241,21 @@ import LabelCore
         change { $0.items.removeAll { selectionIDs.contains($0.id) } }; selection = nil
     }
     func undo() {
+        finishTextEditing()
         if let doc = history.undo(document) {
             document = doc; selectionIDs.formIntersection(Set(doc.items.map(\.id))); dirty = true; render()
         }
     }
     func redo() {
+        finishTextEditing()
         if let doc = history.redo(document) {
             document = doc; selectionIDs.formIntersection(Set(doc.items.map(\.id))); dirty = true; render()
         }
     }
-    func beginGesture() { if gestureStart == nil { gestureStart = document } }
+    func beginGesture() { finishTextEditing(); if gestureStart == nil { gestureStart = document } }
     /// Keep all mouse updates transient; selected objects share one bounded
     /// translation so group spacing remains intact at the tape edges.
-    @discardableResult func drag(id: UUID, dx: Double, dy: Double, resize: Bool = false, snapToleranceMM: Double = 0) -> LabelItem? {
+    @discardableResult func drag(id: UUID, dx: Double, dy: Double, resize: Bool = false, snapToleranceMM: Double = 0, handle: ResizeHandle = .bottomRight) -> LabelItem? {
         beginGesture()
         guard let start = gestureStart, let anchor = start.items.first(where: { $0.id == id }) else { return nil }
         if gestureIDs.isEmpty {
@@ -203,7 +265,26 @@ import LabelCore
         let items = start.items.filter { gestureIDs.contains($0.id) }
         snapX = nil; snapY = nil
         if resize {
-            var item = anchor; item.width += dx; item.height += dy
+            var item = anchor
+            let maxLength = start.autoLength ? 1000 : start.lengthMM
+            let centerX = anchor.x + anchor.width / 2, centerY = anchor.y + anchor.height / 2
+            let maxWidth = handle.horizontal < 0 ? anchor.x + anchor.width : handle.horizontal > 0 ? maxLength - anchor.x : 2 * min(centerX, maxLength - centerX)
+            let maxHeight = handle.vertical < 0 ? anchor.y + anchor.height : handle.vertical > 0 ? start.tapeMM - anchor.y : 2 * min(centerY, start.tapeMM - centerY)
+            let width = min(maxWidth, max(0.5, anchor.width + dx * handle.horizontal))
+            let height = min(maxHeight, max(0.5, anchor.height + dy * handle.vertical))
+            if item.keepsAspectRatio || item.kind == .qr {
+                let useWidth = handle.vertical == 0 || (handle.horizontal != 0 && abs(dx / anchor.width) >= abs(dy / anchor.height))
+                if item.kind == .qr {
+                    let side = min(maxWidth, maxHeight, useWidth ? width : height)
+                    item.width = side; item.height = side
+                } else {
+                    item.resizeImage(width: useWidth ? width : nil, height: useWidth ? nil : height,
+                                     maxWidth: maxWidth, maxHeight: maxHeight)
+                }
+            } else { item.width = width; item.height = height }
+            if item.kind == .qr { item.width = min(item.width, item.height); item.height = item.width }
+            item.x = handle.horizontal < 0 ? anchor.x + anchor.width - item.width : handle.horizontal == 0 ? centerX - item.width / 2 : anchor.x
+            item.y = handle.vertical < 0 ? anchor.y + anchor.height - item.height : handle.vertical == 0 ? centerY - item.height / 2 : anchor.y
             clamp(&item, in: start); draggedItems = [id: item]
         } else {
             let maxLength = start.autoLength ? 1000 : start.lengthMM
@@ -242,6 +323,7 @@ import LabelCore
         return draggedItems[id]
     }
     func endGesture() {
+        finishTextEditing()
         let moved = draggedItems
         gestureStart = nil; gestureIDs = []; gestureWidths = [:]; draggedItems = [:]
         snapX = nil; snapY = nil
@@ -278,6 +360,57 @@ import LabelCore
             message = "Image converted to grayscale and blank edges trimmed"
         } catch { message = error.localizedDescription }
     }
+    func centerSelectionOnLabel() {
+        guard !selectionIDs.isEmpty else { return }
+        endGesture()
+        change { doc in
+            doc.align(selectionIDs, to: .horizontalCenter)
+            doc.align(selectionIDs, to: .verticalCenter)
+        }
+    }
+    func focusLabel(_ index: Int, objectID: UUID? = nil, editText: Bool = false) {
+        selectLabel(index, focus: true)
+        if let objectID, document.items.contains(where: { $0.id == objectID }) { selection = objectID }
+        if editText, let item = selected {
+            if item.kind == .text { beginTextEditing(item.id) }
+            else if item.kind == .image { cropImageItem = item }
+        }
+    }
+    func copyToEmptyLabels() {
+        guard let sheet = document.sheet else { return }
+        let targets = Set(sheet.labels.indices.filter { $0 != sheet.activeIndex && sheet.labels[$0].isEmpty })
+        copyLabel(to: targets)
+    }
+    func replaceSelectedImage(url: URL? = nil) {
+        guard let item = selected, item.kind == .image else { return }
+        var source = url
+        if source == nil {
+            let panel = NSOpenPanel(); panel.allowedContentTypes = [.png, .jpeg, .tiff, .heic]
+            panel.allowsMultipleSelection = false
+            guard panel.runModal() == .OK else { return }; source = panel.url
+        }
+        guard let source else { return }
+        do {
+            let data = try Data(contentsOf: source)
+            guard data.count <= 20_000_000, let image = NSImage(data: data),
+                  let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+                  let png = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:]),
+                  png.count <= 20_000_000 else { throw RenderError.failed("Choose an image smaller than 20 MB") }
+            edit { $0.imageData = png; $0.content = source.lastPathComponent }
+            message = "Image replaced; position and frame preserved"
+        } catch { message = error.localizedDescription }
+    }
+    func applyCrop(id: UUID, normalized: CGRect) {
+        guard let index = document.items.firstIndex(where: { $0.id == id }), let data = document.items[index].imageData,
+              let image = NSImage(data: data), let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+        let unit = normalized.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+        guard !unit.isNull, unit.width > 0.001, unit.height > 0.001,
+              let crop = cg.cropping(to: CGRect(x: unit.minX * Double(cg.width), y: unit.minY * Double(cg.height),
+                                               width: unit.width * Double(cg.width), height: unit.height * Double(cg.height)).integral),
+              let png = NSBitmapImageRep(cgImage: crop).representation(using: .png, properties: [:]) else { return }
+        change { $0.items[index].imageData = png }
+        message = "Image cropped; frame preserved"
+    }
     func importImage(url: URL? = nil) {
         var url = url
         if url == nil {
@@ -297,6 +430,7 @@ import LabelCore
         } catch { message = error.localizedDescription }
     }
     private func confirmDiscard() -> Bool {
+        finishTextEditing()
         guard dirty else { return true }
         let alert = NSAlert(); alert.messageText = "Save changes to this label?"
         alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel"); alert.addButton(withTitle: "Discard")
@@ -304,7 +438,11 @@ import LabelCore
     }
     func canClose() -> Bool { confirmDiscard() }
     func newLabel() {
-        guard confirmDiscard() else { return }; document = .blank; fileURL = nil; dirty = false
+        guard confirmDiscard() else { return }
+        let a4 = isA4
+        document = .blank
+        if a4 { configureSheet(&document, layout: SheetLayout()) }
+        fileURL = nil; dirty = false
         history = DocumentHistory(); selection = nil; render()
     }
     func open() {
@@ -313,10 +451,14 @@ import LabelCore
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
             let data = try Data(contentsOf: url)
-            guard data.count <= 40_000_000 else { throw DocumentError.invalid }
+            guard data.count <= 250_000_000 else { throw DocumentError.invalid }
             let doc = try JSONDecoder().decode(LabelDocument.self, from: data).validated()
             document = doc.normalizingMinimumLength(); fileURL = url; dirty = document != doc
-            history = DocumentHistory(); selection = nil; render()
+            history = DocumentHistory(); selection = nil
+            let rememberedPrinter = UserDefaults.standard.string(forKey: "lastA4Printer") ?? "A4 / PDF"
+            printerName = document.sheet == nil ? "PT-2430PC" : systemPrinters.contains(rememberedPrinter) ? rememberedPrinter : "A4 / PDF"
+            sheetOverview = true; render()
+            Task { await refreshPrinter() }
             if dirty { message = "Short label expanded to 25.4 mm with equal padding on both sides. Save to keep the corrected layout." }
         } catch { message = error.localizedDescription }
     }
@@ -330,12 +472,15 @@ import LabelCore
         guard let url = destination else { return false }
         do {
             let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            try encoder.encode(document.validated()).write(to: url, options: .atomic)
+            let data = try encoder.encode(document.validated())
+            guard data.count <= 250_000_000 else { throw RenderError.failed("Document exceeds 250 MB. Use smaller images before saving.") }
+            try data.write(to: url, options: .atomic)
             fileURL = url; dirty = false; message = "Saved \(url.lastPathComponent)"; return true
         } catch { message = error.localizedDescription; return false }
     }
     func export() {
         endGesture()
+        if isA4 { exportSheet(); return }
         guard let rendered else { message = renderError ?? "Nothing to export"; return }
         let panel = NSSavePanel(); panel.allowedContentTypes = [.png]; panel.nameFieldStringValue = document.name + ".png"
         guard panel.runModal() == .OK, let url = panel.url else { return }
@@ -343,13 +488,19 @@ import LabelCore
         catch { message = error.localizedDescription }
     }
     func refreshPrinter() async {
+        systemPrinters = Self.a4Printers()
+        if isA4 { connected = printerName != "A4 / PDF" && systemPrinters.contains(printerName); message = "A4 · 210 × 297 mm"; return }
         guard !busy else { return }; busy = true; defer { busy = false }
-        do { let response = try await printer.status(); connected = response.ok
+        let checkedPrinter = printerName
+        do { let response = try await printer.status()
+            guard printerName == checkedPrinter && !isA4 else { return }
+            connected = response.ok
             message = response.ok ? "PT-2430PC ready · \(response.tapeMM ?? 0) mm loaded" : response.message
         } catch { connected = false; message = error.localizedDescription }
     }
     func printLabel() async {
         endGesture()
+        if isA4 { printSheet(); return }
         guard !busy, let rendered else { return }; busy = true; defer { busy = false }
         let tape = Int(document.tapeMM), copies = copies, cut = cut
         message = "Printing…"
@@ -359,4 +510,94 @@ import LabelCore
             message = result.message; if !result.ok { connected = false }
         } catch { connected = false; message = error.localizedDescription }
     }
+    func choosePrinter(_ name: String) {
+        endGesture()
+        let tapePrinter = name.localizedCaseInsensitiveContains("PT-2430PC")
+        let switchingMode = tapePrinter == isA4
+        if !tapePrinter && !isA4 {
+            tapeDraft = document; tapeHistory = history
+            history = sheetHistory
+            var next = sheetDraft ?? LabelDocument.blank
+            if next.sheet == nil { configureSheet(&next, layout: SheetLayout()) }
+            document = next
+        } else if tapePrinter && isA4 {
+            sheetDraft = document; sheetHistory = history
+            document = tapeDraft ?? .blank; history = tapeHistory
+        }
+        printerName = tapePrinter ? "PT-2430PC" : name
+        if !tapePrinter && name != "A4 / PDF" { UserDefaults.standard.set(name, forKey: "lastA4Printer") }
+        if switchingMode { selection = nil; fit = true; sheetOverview = true; dirty = true }
+        render()
+        Task { await refreshPrinter() }
+    }
+    private func configureSheet(_ doc: inout LabelDocument, layout: SheetLayout) {
+        doc.sheet = layout; doc.autoLength = false
+        doc.lengthMM = layout.template.width; doc.tapeMM = layout.template.height
+        doc.items = layout.labels[layout.activeIndex]
+    }
+    func selectLabel(_ index: Int, focus: Bool = false) {
+        let wasOverview = sheetOverview
+        endGesture()
+        guard let sheet = document.sheet, sheet.labels.indices.contains(index) else { return }
+        document.syncActiveLabel()
+        document.sheet!.activeIndex = index; document.items = document.sheet!.labels[index]
+        selection = document.items.count == 1 ? document.items[0].id : nil; render()
+        if focus { sheetOverview = false; if wasOverview { fit = true } }
+    }
+    func setTemplate(_ id: String) {
+        guard let template = SheetTemplate.find(id), id != document.sheet?.templateID else { return }
+        endGesture()
+        change { doc in
+            let previous = doc.sheet
+            var next = SheetLayout(templateID: id)
+            // Preserve designs by position; undo restores the complete previous layout.
+            if let previous {
+                for index in 0..<min(previous.labels.count, next.labels.count) {
+                    next.labels[index] = previous.labels[index].map { original in
+                        var item = original
+                        item.width = min(item.width, template.width); item.height = min(item.height, template.height)
+                        item.x = min(item.x, template.width - item.width); item.y = min(item.y, template.height - item.height)
+                        item.fitTextToBox(); return item
+                    }
+                }
+                next.plainPaper = previous.plainPaper; next.cutLines = previous.cutLines
+            }
+            configureSheet(&doc, layout: next)
+        }
+        selection = nil; fit = true; sheetOverview = true
+    }
+    func editSheet(_ action: (inout SheetLayout) -> Void) {
+        endGesture()
+        change { doc in if var sheet = doc.sheet { action(&sheet); doc.sheet = sheet } }
+    }
+    func copyLabel(to targets: Set<Int>) {
+        endGesture()
+        guard let source = document.sheet?.activeIndex else { return }
+        change { doc in doc.sheet?.copyLabel(from: source, to: targets) }
+        message = "Copied label \(source + 1) to \(targets.subtracting([source]).count) positions"
+    }
+    func clearActiveLabel() { endGesture(); change { $0.items = [] }; selection = nil }
+    func exportSheet() {
+        let panel = NSSavePanel(); panel.allowedContentTypes = [.pdf]
+        panel.nameFieldStringValue = document.name + ".pdf"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do { try SheetRenderer.pdf(document).write(to: url, options: .atomic); message = "Exported \(url.lastPathComponent)" }
+        catch { message = error.localizedDescription }
+    }
+    func printSheet() {
+        guard !busy, let sheet = document.sheet else { return }
+        guard !sheet.printPositions.isEmpty else { message = "Select at least one print position"; return }
+        do {
+            let data = try SheetRenderer.pdf(document)
+            let view = try SheetPrintView(data: data)
+            let info = SheetPrintSettings.make(printerName: printerName, copies: copies)
+            let operation = NSPrintOperation(view: view, printInfo: info)
+            operation.showsPrintPanel = true; operation.showsProgressPanel = true
+            operation.printPanel.options.formUnion([.showsPaperSize, .showsOrientation, .showsScaling])
+            if operation.run() {
+                message = operation.printInfo.jobDisposition == .save ? "PDF file saved" : "A4 print job submitted"
+            } else { message = "Printing cancelled" }
+        } catch { message = error.localizedDescription }
+    }
+
 }

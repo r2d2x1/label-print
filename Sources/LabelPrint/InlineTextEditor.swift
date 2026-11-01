@@ -8,6 +8,7 @@ struct InlineTextEditor: NSViewRepresentable {
     let item: LabelItem
     let scale: Double
     let autoWidth: Bool
+    var selectAllOnStart = false
     let onChange: (String) -> Void
     let onFinish: () -> Void
 
@@ -37,7 +38,8 @@ struct InlineTextEditor: NSViewRepresentable {
         view.setAccessibilityLabel("Edit label text directly")
         configure(view)
         view.string = item.content
-        view.setSelectedRange(NSRange(location: (view.string as NSString).length, length: 0))
+        let count = (view.string as NSString).length
+        view.setSelectedRange(selectAllOnStart ? NSRange(location: 0, length: count) : NSRange(location: count, length: 0))
         DispatchQueue.main.async {
             view.window?.makeFirstResponder(view)
         }

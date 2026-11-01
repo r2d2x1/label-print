@@ -31,7 +31,7 @@ enum LabelRenderer {
                 bitsPerComponent: 8, bytesPerRow: w, space: CGColorSpaceCreateDeviceGray(),
                 bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return false }
             cg.setFillColor(gray: 1, alpha: 1); cg.fill(CGRect(x: 0, y: 0, width: w, height: h))
-            try draw(document, in: cg, height: h)
+            try draw(document, in: cg, height: Double(h))
             return true
         }
         guard ok else { throw RenderError.failed("Could not create label bitmap") }
@@ -46,7 +46,7 @@ enum LabelRenderer {
     }
     /// Cache a transparent, monochrome item layer. During dragging the canvas
     /// moves these layers using transforms instead of decoding/rasterizing again.
-    static func renderSprite(_ item: LabelItem, widthMM: Double, smooth: Bool = false) throws -> CGImage {
+    static func renderSprite(_ item: LabelItem, widthMM: Double, smooth: Bool = false, color: Bool = false) throws -> CGImage {
         let resolution = smooth ? min(4.0, max(1.0, sqrt(4_000_000 / max(1, widthMM * item.height * pow(180.0 / 25.4, 2))))) : 1
         let scale = 180.0 / 25.4 * resolution
         let width = max(1, Int(ceil(widthMM * scale)))
@@ -61,9 +61,9 @@ enum LabelRenderer {
             cg.clear(CGRect(x: 0, y: 0, width: width, height: height))
             var local = item; local.x = 0; local.y = 0; local.width = widthMM
             var doc = LabelDocument(); doc.autoLength = false; doc.items = [local]
-            try draw(doc, in: cg, height: height, resolution: resolution, smooth: smooth)
+            try draw(doc, in: cg, height: Double(height), resolution: resolution, smooth: smooth, color: color)
         }
-        for offset in stride(from: 0, to: smooth ? 0 : pixels.count, by: 4) {
+        for offset in stride(from: 0, to: smooth || color ? 0 : pixels.count, by: 4) {
             let alpha = Int(pixels[offset + 3])
             guard alpha > 0 else { continue }
             let gray = (Int(pixels[offset]) + Int(pixels[offset + 1]) + Int(pixels[offset + 2])) / 3
@@ -79,7 +79,7 @@ enum LabelRenderer {
         }
         return image
     }
-    private static func draw(_ document: LabelDocument, in cg: CGContext, height h: Int, resolution: Double = 1, smooth: Bool = false) throws {
+    static func draw(_ document: LabelDocument, in cg: CGContext, height h: Double, resolution: Double = 1, smooth: Bool = false, color: Bool = false) throws {
             cg.translateBy(x: 0, y: CGFloat(h)); cg.scaleBy(x: 1, y: -1)
             cg.setShouldAntialias(true)
             NSGraphicsContext.saveGraphicsState()
@@ -106,13 +106,13 @@ enum LabelRenderer {
                     }
                     // Four modules of quiet zone on every side; integer dots/module.
                     let modules = image.width
-                    let factor = Int(min(rect.width, rect.height)) / (modules + 8)
-                    guard factor >= 1 else { throw RenderError.failed("QR box is too small for its content. Enlarge it or shorten the content.") }
-                    let total = CGFloat((modules + 8) * factor)
+                    let factor = color ? min(rect.width, rect.height) / Double(modules + 8) : Double(Int(min(rect.width, rect.height)) / (modules + 8))
+                    guard factor > 0 else { throw RenderError.failed("QR box is too small for its content. Enlarge it or shorten the content.") }
+                    let total = CGFloat(Double(modules + 8) * factor)
                     let quiet = CGFloat(4 * factor)
                     let left = (rect.midX - total / 2 + quiet).rounded()
                     let top = (rect.midY - total / 2 + quiet).rounded()
-                    let side = CGFloat(modules * factor)
+                    let side = CGFloat(Double(modules) * factor)
                     let target = CGRect(x: left, y: top, width: side, height: side)
                     cg.setFillColor(gray: 1, alpha: 1); cg.fill(rect)
                     draw(image, in: target, context: cg, interpolate: false)
@@ -122,6 +122,10 @@ enum LabelRenderer {
                         throw RenderError.failed("An image could not be loaded")
                     }
                     let target = aspectFit(bitmap, rect)
+                    if color {
+                        draw(bitmap, in: target, context: cg, interpolate: true)
+                        break
+                    }
                     let halftone = try halftone(bitmap, width: max(1, Int(target.width.rounded())),
                                                 height: max(1, Int(target.height.rounded())), quantize: !smooth)
                     draw(halftone, in: target, context: cg, interpolate: false)

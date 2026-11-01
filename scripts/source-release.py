@@ -9,7 +9,7 @@ spec = spec_from_file_location('notices', ROOT / 'scripts/third-party-notices.py
 notices = module_from_spec(spec)
 spec.loader.exec_module(notices)
 notices.main()
-destination = ROOT / 'docs/releases/LabelPrint-0.1.0-source.tar.gz'
+destination = ROOT / 'docs/releases/LabelPrint-0.2.0-source.tar.gz'
 destination.parent.mkdir(exist_ok=True)
 exclude = {'.git', '.DS_Store', '__pycache__', '.build', '.cache', '.idea', '.swiftpm', 'dist'}
 
@@ -27,7 +27,7 @@ def clean(info):
 with tarfile.open(destination, 'w:gz') as archive:
     for name in ('Sources', 'Tests', 'backend', 'scripts', 'vendor/ptouch-rs',
                  'ThirdPartyNotices', 'docs', 'Package.swift', 'CMakeLists.txt',
-                 'README.md', 'LICENSE', 'NOTICE', '.gitignore', 'assets/app-ui.png'):
+                 'README.md', 'LICENSE', 'NOTICE', '.gitignore', 'assets'):
         if (ROOT / name).exists():
             archive.add(ROOT / name, arcname='LabelPrint/' + name, filter=clean)
     for package in notices.dependencies():

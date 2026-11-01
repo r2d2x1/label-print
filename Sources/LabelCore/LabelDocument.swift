@@ -12,6 +12,8 @@ public struct LabelItem: Identifiable, Codable, Equatable, Sendable {
     public var height: Double
     public var fontName: String? = nil
     public var fontSize: Double = 10
+    public var autoFitText: Bool? = nil
+    public var lockAspectRatio: Bool? = nil
     public var bold = false
     public var italic = false
     public var alignment = "left"
@@ -38,6 +40,44 @@ public extension LabelItem {
         }
         return italic ? manager.convert(font, toHaveTrait: .italicFontMask) : font
     }
+    var keepsAspectRatio: Bool { kind == .image && (lockAspectRatio ?? false) }
+
+    mutating func resizeImage(width proposedWidth: Double? = nil, height proposedHeight: Double? = nil,
+                              maxWidth: Double, maxHeight: Double) {
+        guard keepsAspectRatio, width > 0, height > 0 else { return }
+        let requested = proposedWidth.map { $0 / width } ?? proposedHeight.map { $0 / height } ?? 1
+        guard requested.isFinite else { return }
+        let minimum = max(0.5 / width, 0.5 / height)
+        let maximum = min(maxWidth / width, maxHeight / height)
+        guard minimum <= maximum else { return }
+        let factor = min(maximum, max(minimum, requested))
+        width *= factor; height *= factor
+    }
+
+    var automaticallyFitsText: Bool { autoFitText ?? false }
+
+    /// Fit complete lines using the same font metrics as the print renderer.
+    mutating func fitTextToBox(constrainWidth: Bool = true) {
+        guard kind == .text, automaticallyFitsText, !content.isEmpty else { return }
+        let availableWidth = max(0.1, width * 72 / 25.4 - 0.8)
+        let availableHeight = max(0.1, height * 72 / 25.4 - 0.8)
+        func fits(_ size: Double) -> Bool {
+            let font = resolvedFont(ofSize: size)
+            let bounds = (content as NSString).boundingRect(
+                with: NSSize(width: 1_000_000, height: 1_000_000),
+                options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: [.font: font])
+            let lineHeight = font.ascender - font.descender + font.leading
+            return (!constrainWidth || bounds.width <= availableWidth)
+                && max(bounds.height, lineHeight) <= availableHeight
+        }
+        var lower = 1.0, upper = 200.0
+        for _ in 0..<20 {
+            let middle = (lower + upper) / 2
+            if fits(middle) { lower = middle } else { upper = middle }
+        }
+        fontSize = (lower * 100).rounded(.down) / 100
+    }
+
     var printFont: NSFont { resolvedFont(ofSize: fontSize * 180 / 72) }
     var naturalTextWidthMM: Double {
         let longest = content.components(separatedBy: .newlines).map {
@@ -58,6 +98,7 @@ public struct LabelDocument: Codable, Equatable, Sendable {
     public var autoLength = true
     public var marginMM: Double = 2
     public var items: [LabelItem] = []
+    public var sheet: SheetLayout? = nil
     public init() {}
     public static var blank: LabelDocument {
         var doc = LabelDocument()
@@ -82,10 +123,11 @@ public struct LabelDocument: Codable, Equatable, Sendable {
             item.x + (item.kind == .text ? item.naturalTextWidthMM : item.width)
         }.max() ?? 0) + marginMM))
     }
-    public var effectiveLengthMM: Double { autoLength ? contentLengthMM : max(Self.minimumLengthMM, lengthMM) }
+    public var effectiveLengthMM: Double { sheet != nil ? lengthMM : autoLength ? contentLengthMM : max(Self.minimumLengthMM, lengthMM) }
     /// Expand older short documents symmetrically; never shift just the print
     /// stream, which would make the editable preview disagree with output.
     public func normalizingMinimumLength() -> LabelDocument {
+        guard sheet == nil else { return self }
         let oldLength = autoLength ? max(20, min(1000, (items.map {
             $0.x + ($0.kind == .text ? $0.naturalTextWidthMM : $0.width)
         }.max() ?? 0) + marginMM)) : lengthMM
@@ -107,25 +149,39 @@ public struct LabelDocument: Codable, Equatable, Sendable {
         switch tape { case 6: return 32; case 9: return 52; case 12: return 76; case 18: return 120; case 24: return 128; default: return 0 }
     }
     public var printableInsetMM: Double {
-        Double((pixelHeight - Self.printableDots(tapeMM)) / 2) * 25.4 / 180
+        if sheet != nil { return 0 }
+        return Double((pixelHeight - Self.printableDots(tapeMM)) / 2) * 25.4 / 180
     }
-    public var printableHeightMM: Double { Double(Self.printableDots(tapeMM)) * 25.4 / 180 }
+    public var printableHeightMM: Double { sheet != nil ? tapeMM : Double(Self.printableDots(tapeMM)) * 25.4 / 180 }
     public var printableBottomMM: Double { printableInsetMM + printableHeightMM }
     public func validated() throws -> LabelDocument {
-        guard version == 1, [6.0, 9, 12, 18, 24].contains(tapeMM),
-              lengthMM.isFinite, (20...1000).contains(lengthMM), marginMM.isFinite, (0...20).contains(marginMM), items.count <= 500 else {
-            throw DocumentError.invalid
-        }
-        guard Set(items.map(\.id)).count == items.count else { throw DocumentError.invalid }
-        for i in items {
-            guard [i.x, i.y, i.width, i.height, i.fontSize].allSatisfy(\.isFinite),
-                  i.x >= 0, i.y >= 0, i.width >= 0.5, i.height >= 0.5,
-                  i.x + i.width <= 1000, i.y + i.height <= tapeMM + 0.001,
-                  (1...200).contains(i.fontSize), (i.fontName?.count ?? 0) <= 200, i.content.count <= 10000,
-                  (i.imageData?.count ?? 0) <= 20_000_000 else { throw DocumentError.invalid }
+        guard version == 1, lengthMM.isFinite, marginMM.isFinite,
+              (0...20).contains(marginMM), items.count <= 500 else { throw DocumentError.invalid }
+        if let sheet {
+            try sheet.validated()
+            guard !autoLength, lengthMM == sheet.template.width, tapeMM == sheet.template.height,
+                  items == sheet.labels[sheet.activeIndex] else { throw DocumentError.invalid }
+            try validateItems(width: lengthMM, height: tapeMM)
+        } else {
+            guard [6.0, 9, 12, 18, 24].contains(tapeMM), (20...1000).contains(lengthMM) else { throw DocumentError.invalid }
+            try validateItems(width: 1000, height: tapeMM)
         }
         return self
     }
+    public func validateItems(width: Double, height: Double) throws {
+        guard items.count <= 500, Set(items.map(\.id)).count == items.count else { throw DocumentError.invalid }
+        for i in items {
+            guard [i.x, i.y, i.width, i.height, i.fontSize].allSatisfy(\.isFinite),
+                  i.x >= 0, i.y >= 0, i.width >= 0.5, i.height >= 0.5,
+                  i.x + i.width <= width + 0.001, i.y + i.height <= height + 0.001,
+                  (1...200).contains(i.fontSize), (i.fontName?.count ?? 0) <= 200, i.content.count <= 10000,
+                  (i.imageData?.count ?? 0) <= 20_000_000 else { throw DocumentError.invalid }
+        }
+    }
+    public mutating func syncActiveLabel() {
+        if let index = sheet?.activeIndex, sheet!.labels.indices.contains(index) { sheet!.labels[index] = items }
+    }
+
 }
 public enum DocumentError: LocalizedError {
     case invalid
